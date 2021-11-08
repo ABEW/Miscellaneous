@@ -6,11 +6,17 @@ Description: Find duplicate images in specified directory that
 """
 
 import os
-import glob
+import sys
+
 import hashlib
 import json
 
 import numpy as np
+
+import tensorflow as tf
+from tensorflow.keras.applications import vgg16
+
+from data_preprocessing import get_files, load_images
 
 
 def hash_data(data_in, encode=True):
@@ -56,63 +62,6 @@ def test_hashing():
     result_2 = hash_data(value_2)
 
     assert result_1 != result_2
-
-
-def get_files(
-    base_dir, reg_ex, in_depth=True, include_symlink=False, return_relative=True
-):
-    """
-    Returns list of file paths that satisfy the regex passed with unlimited depth if in_depth
-    is true
-
-    args:
-        base_dir:: str
-            path to the directory to search
-        reg_ex:: str, list[str]
-            string or list of strings that specify file types to lookup
-        in_depth:: Boolean
-            whether or not to traverse beyond the base directory
-        include_symlink:: Boolean
-            whethere or not to follow symbolic links - ideally False
-        return_relative:: Boolean
-            whether or not to return a relative path to the files with specified extensions
-
-    returns:
-        file_path_list:: list
-            list of paths to files that match the specified set of regular expressions
-    """
-
-    # determines whether we do an extesive search of the directory or only 1 layer deep
-    if in_depth:
-        search_dir = base_dir + "/**/"
-    else:
-        search_dir = base_dir + "/"
-
-    # make reg_ex into list that we can recurse on and append to the file list
-    if not isinstance(reg_ex, list):
-        reg_ex = [reg_ex]
-
-    # instantiate an empty list for file paths
-    file_path_list = []
-
-    # walk into the search directory and add the list of files to file_path_list
-    for file_type in reg_ex:
-        file_path_list.extend(glob.glob(search_dir + file_type, recursive=True))
-
-    # if symbolic links are included it will artificially create a duplicate where there is none
-    # so best to not traverse symbolic links in the search
-    if not include_symlink:
-        non_sym_dirs = [x[0] for x in os.walk(base_dir)]
-        file_path_list = [
-            file_path
-            for file_path in file_path_list
-            if os.path.dirname(file_path) in non_sym_dirs
-        ]
-
-    if return_relative:
-        return [os.path.relpath(path, start=base_dir) for path in file_path_list]
-
-    return file_path_list
 
 
 def run_duplicate_finder(
@@ -216,15 +165,91 @@ if __name__ == "__main__":
 
     HOME_DIR = os.environ["HOME"]
 
-    PATH_TO_SEARCH = os.path.join(HOME_DIR, "Desktop")
+    PATH_TO_SEARCH = os.path.join(HOME_DIR, "Desktop", "Screen_shots")
 
     SEARCH_REGEX = ["*.png", "*.jpg", "*.jpeg"]
 
-    run_duplicate_finder(
+    OUTPUT_SAVE_LOC = os.path.dirname(os.path.abspath(__file__))
+
+    DUPLICATE_THRESHOLD = np.float(5e-3)
+
+    TEMP_DATA_DIR = os.path.join(OUTPUT_SAVE_LOC, '.temp', 'data')
+
+    # run_duplicate_finder(
+    #     base_dir=PATH_TO_SEARCH,
+    #     reg_ex=SEARCH_REGEX,
+    #     in_depth=False,
+    #     include_symlink=FOLLOW_SYM_LINKS,
+    #     return_relative=True,
+    #     save_data=True,
+    # )
+
+    files = get_files(
         base_dir=PATH_TO_SEARCH,
         reg_ex=SEARCH_REGEX,
-        in_depth=False,
+        in_depth=True,
         include_symlink=FOLLOW_SYM_LINKS,
-        return_relative=True,
-        save_data=True,
+        return_relative=False,
     )
+
+    if len(files) < 1:
+        print("NO FILES FOUND WITH SPECIFIED REGEX AND SEARCH PATH")
+        sys.exit()
+
+    
+
+    # imgs_scaled = load_images(
+    #     files, new_dims=(224,224), save_data=True, save_path=TEMP_DATA_DIR
+    # )
+    imgs_scaled = load_images(
+        files, new_dims=None, save_data=False, save_path=TEMP_DATA_DIR
+    )
+
+    files = np.asarray([os.path.relpath(path, start=HOME_DIR) for path in files])
+
+    imgs_tensor = tf.convert_to_tensor(imgs_scaled, dtype=tf.float32) / 255.0
+    
+    feature_extractor = vgg16.VGG16(
+        include_top=False,
+        input_tensor=None,
+        input_shape=imgs_tensor.shape[1:],
+        pooling=None,
+    )
+
+    img_features = feature_extractor(imgs_tensor)
+
+    dist_euclidean = {}
+
+    for img_name, img_feature in zip(files, img_features):
+        valid_idx = (np.asarray(files) != img_name)
+        
+        squared_err = tf.math.reduce_mean(
+            tf.math.square(img_features[valid_idx] - img_feature), axis=[-1,-2,-3]
+        ).numpy()
+
+        sort_idx = np.argsort(squared_err)
+        
+        dist_euclidean[img_name]= list(
+            zip(files[valid_idx][sort_idx], squared_err[sort_idx].astype('str')))
+
+    similarity_file = os.path.join(OUTPUT_SAVE_LOC, "similarity_measure.json")
+
+    with open(similarity_file, "w") as f:
+        json.dump(dist_euclidean, f, indent=4)
+
+    # This could be done from a prior JSON file if it exists
+    duplicate_pred_file = os.path.join(OUTPUT_SAVE_LOC, "duplicate_estimates.json")
+
+    dict_duplicates = {}
+
+    for key, val in dist_euclidean.items():
+        max_idx = 0
+        for _, dist_est in val:
+            if float(dist_est) >= DUPLICATE_THRESHOLD:
+                break
+            max_idx += 1
+        if max_idx > 0:
+            dict_duplicates[key] = [x[0] for x in val[:max_idx]]
+    
+    with open(duplicate_pred_file, "w") as f:
+        json.dump(dict_duplicates, f, indent=4)
